@@ -148,16 +148,16 @@ func (a *App) Run() error {
 
 func (a *App) logOnError(v video.Video, err error) {
 	if v == nil {
-		log.Printf("Error receiving video: %s", err.Error())
+		log.Printf("Error receiving video: %+v", err.Error())
 		return
 	}
 
 	r := v.GetRequest()
 
-	log.Printf("Error processing video %s: %s", r.Id, err.Error())
+	log.Printf("Error processing video %s: %+v", r.Id, err.Error())
 
 	err = r.SetStatus("error", a.DB)
 	if err != nil {
-		log.Printf("Error saving status on video %s: %s", r.Id, err.Error())
+		log.Printf("Error saving status on video %s: %+v", r.Id, err.Error())
 	}
 }
