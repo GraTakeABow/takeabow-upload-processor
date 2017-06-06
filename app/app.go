@@ -122,7 +122,7 @@ func (a *App) Run() error {
 
 		r := v.GetRequest()
 		r.SetOriginalUrl(a.DB)
-
+		fmt.Printf("Processing %s video\n%+v\n", r.GetSource(), r)
 		err = a.processor.Process(v)
 		if err != nil {
 			a.logOnError(v, err)
@@ -141,6 +141,7 @@ func (a *App) Run() error {
 		}
 
 		d.Ack(false)
+		fmt.Printf("Done processing %s video\n%+v\n", r.GetSource(), r)
 	}
 
 	return errors.New("Listen queue exited")

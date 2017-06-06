@@ -123,6 +123,8 @@ func (p *Processor) processFile(f *os.File, id string) error {
 		return err
 	}
 
+	log.Printf("Uploaded %s to s3://%s/%s", id, p.bucket, key)
+
 	err = p.uploadSmallVideo(processed, id)
 
 	if err != nil {
@@ -164,6 +166,8 @@ func (p *Processor) uploadSmallVideo(f *os.File, id string) error {
 	if err != nil {
 		return err
 	}
+
+	log.Printf("Uploaded %s to s3://%s/%s", id, p.bucket, key)
 
 	return nil
 }
