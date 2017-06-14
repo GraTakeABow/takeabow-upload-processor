@@ -10,7 +10,9 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/streadway/amqp"
 	"github.com/therealpenguin/takeabow-upload-processor/processor"
+	"github.com/therealpenguin/takeabow-upload-processor/timecode"
 	"github.com/therealpenguin/takeabow-upload-processor/video"
+	"gopkg.in/redis.v5"
 	"log"
 	"os"
 )
@@ -18,9 +20,11 @@ import (
 const EnvBucket = "BOW_BUCKET"
 const EnvProcessedPrefix = "BOW_PREFIX_PROCESSED"
 const EnvSmallPrefix = "BOW_PREFIX_SMALL"
+const EnvSplitPrefix = "BOW_PREFIX_SPLIT"
 const EnvAMQPUrl = "BOW_AMQP"
 const EnvMYSQLDsn = "BOW_MYSQL_DSN"
 const EnvTmpDir = "BOW_TMP_DIR"
+const EnvRedisAddr = "BOW_REDIS_ADDR"
 
 const ChannelUploads = "uploads"
 
@@ -37,6 +41,9 @@ type App struct {
 	TmpDir          string
 	processor       *processor.Processor
 	SmallPrefix     string
+	Timecodes       *[]timecode.Timecode
+	SplitPrefix     string
+	Redis           *redis.Client
 }
 
 // NewVideoRequest creates and validates the application's config
@@ -46,6 +53,7 @@ func New() (*App, error) {
 		ProcessedPrefix: os.Getenv(EnvProcessedPrefix),
 		TmpDir:          os.Getenv(EnvTmpDir),
 		SmallPrefix:     os.Getenv(EnvSmallPrefix),
+		SplitPrefix:     os.Getenv(EnvSplitPrefix),
 	}
 
 	if a.Bucket == "" {
@@ -62,6 +70,10 @@ func New() (*App, error) {
 
 	if a.SmallPrefix == "" {
 		return nil, errors.New(fmt.Sprintf(TemplateEmpty, EnvSmallPrefix))
+	}
+
+	if a.SplitPrefix == "" {
+		return nil, errors.New(fmt.Sprintf(TemplateEmpty, EnvSplitPrefix))
 	}
 
 	// Make the temp directory if it doesn't exist
@@ -90,7 +102,45 @@ func New() (*App, error) {
 	}
 	a.Sess = session
 	a.S3 = s3.New(session)
-	a.processor = processor.New(a.Sess, a.TmpDir, a.Bucket, a.ProcessedPrefix, a.SmallPrefix)
+
+	redisAddr := os.Getenv(EnvRedisAddr)
+	if redisAddr == "" {
+		return nil, errors.New(fmt.Sprintf(TemplateEmpty, EnvRedisAddr))
+	}
+
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:     redisAddr,
+		Password: "", // no password set
+		DB:       0,  // use default DB
+	})
+
+	_, err = redisClient.Ping().Result()
+
+	if err != nil {
+		return nil, err
+	}
+
+	a.Redis = redisClient
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+
+	f, err := os.Open(fmt.Sprintf("%s/timecodes.csv", cwd))
+	if err != nil {
+		return nil, err
+	}
+
+	defer f.Close()
+
+	timecodes, err := timecode.NewFromFile(f)
+	if err != nil {
+		return nil, err
+	}
+	a.Timecodes = timecodes
+
+	a.processor = processor.New(a.Sess, a.TmpDir, a.Bucket, a.ProcessedPrefix, a.SmallPrefix, a.SplitPrefix, a.Redis, timecodes)
 
 	return a, nil
 }

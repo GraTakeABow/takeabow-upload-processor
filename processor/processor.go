@@ -6,7 +6,10 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/therealpenguin/takeabow-upload-processor/timecode"
 	"github.com/therealpenguin/takeabow-upload-processor/video"
+	"gopkg.in/redis.v5"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -20,15 +23,23 @@ type Processor struct {
 	bucket      string
 	prefix      string
 	smallPrefix string
+	splitPrefix string
+	redis       *redis.Client
+	timecodes   *[]timecode.Timecode
 }
 
-func New(sess *session.Session, dir, bucket, prefix, smallPrefix string) *Processor {
+var VideoTooShort = errors.New("Video is too short")
+
+func New(sess *session.Session, dir, bucket, prefix, smallPrefix, splitPrefix string, redis *redis.Client, timecodes *[]timecode.Timecode) *Processor {
 	return &Processor{
 		sess:        sess,
 		dir:         dir,
 		bucket:      bucket,
 		prefix:      prefix,
 		smallPrefix: smallPrefix,
+		splitPrefix: splitPrefix,
+		redis:       redis,
+		timecodes:   timecodes,
 	}
 }
 
@@ -58,12 +69,12 @@ func (p *Processor) Process(v video.Video) error {
 	defer f.Close()
 	defer os.Remove(f.Name())
 
-	err = p.processFile(f, r.Id)
+	r.Duration = p.getDurationInSeconds(f.Name())
+
+	err = p.processFile(f, r)
 	if err != nil {
 		return err
 	}
-
-	r.Duration = p.getDurationInSeconds(f.Name())
 
 	return nil
 }
@@ -83,8 +94,9 @@ func (p *Processor) getFramerate(f *os.File) (string, error) {
 // processFile performs all the transcoding and uploading of a video file
 // It turns an input video into the same video format
 // It uploads the out of that onto S3
+// It splits that into slots and uploads that to S3
 // It processes that output video into a small video, ready for other tasks
-func (p *Processor) processFile(f *os.File, id string) error {
+func (p *Processor) processFile(f *os.File, r *video.VideoRequest) error {
 	// Get the input framerate
 	framerate, err := p.getFramerate(f)
 	if err != nil {
@@ -110,25 +122,32 @@ func (p *Processor) processFile(f *os.File, id string) error {
 		return err
 	}
 
-	key := fmt.Sprintf("%s/%s.mp4", p.prefix, id)
+	key := fmt.Sprintf("%s/%s.mp4", p.prefix, r.Id)
 
-	manager := s3manager.NewUploader(p.sess)
-	_, err = manager.Upload(&s3manager.UploadInput{
-		Key:    aws.String(key),
-		Bucket: aws.String(p.bucket),
-		Body:   processed,
-	})
+	err = p.uploadFile(processed, key)
 
 	if err != nil {
 		return err
 	}
 
-	log.Printf("Uploaded %s to s3://%s/%s", id, p.bucket, key)
+	log.Printf("Uploaded %s to s3://%s/%s", r.Id, p.bucket, key)
 
-	err = p.uploadSmallVideo(processed, id)
+	err = p.uploadSmallVideo(processed, r.Id)
 
 	if err != nil {
 		return err
+	}
+
+	if p.timecodes != nil {
+		for slot, t := range *p.timecodes {
+			err := p.splitVideoAndUpload(t, r.Duration, processed, r.Id, slot)
+			if err != nil {
+				log.Printf("Couldn't split video %s into slot %d: %s\n+%+v\n", r.Id, slot, err.Error(), err)
+			} else {
+				log.Printf("Uploaded %s to slot %d", r.Id, slot)
+			}
+
+		}
 	}
 
 	return nil
@@ -156,12 +175,7 @@ func (p *Processor) uploadSmallVideo(f *os.File, id string) error {
 
 	key := fmt.Sprintf("%s/%s.mp4", p.smallPrefix, id)
 
-	manager := s3manager.NewUploader(p.sess)
-	_, err = manager.Upload(&s3manager.UploadInput{
-		Key:    aws.String(key),
-		Bucket: aws.String(p.bucket),
-		Body:   processed,
-	})
+	err = p.uploadFile(processed, key)
 
 	if err != nil {
 		return err
@@ -170,6 +184,75 @@ func (p *Processor) uploadSmallVideo(f *os.File, id string) error {
 	log.Printf("Uploaded %s to s3://%s/%s", id, p.bucket, key)
 
 	return nil
+}
+
+func (p *Processor) splitVideoAndUpload(timecode timecode.Timecode, duration int, f *os.File, id string, slot int) error {
+	// Check to see if the video can be split into a length specified by timecode.
+	// Try and start the split at 40% through the clip
+	start, err := p.getSplitStart(timecode, float64(duration))
+	if err != nil {
+		if err == VideoTooShort {
+			return nil
+		}
+
+		return err
+	}
+
+	// Make the video to the length specified in the timecode, starting at a specified point
+	command := "ffmpeg -y -r 24 -ss %.9f -i %s -t %.9f %s"
+	destination := fmt.Sprintf("%s-%d-split.mp4", f.Name(), slot)
+
+	args := strings.Split(fmt.Sprintf(command, start, f.Name(), timecode.Length, destination), " ")
+
+	cmd := exec.Command(args[0], args[1:]...)
+	_, err = runCommand(cmd)
+
+	if err != nil {
+		return err
+	}
+
+	defer os.Remove(destination)
+
+	processed, err := os.Open(destination)
+	if err != nil {
+		return err
+	}
+
+	defer processed.Close()
+
+	key := fmt.Sprintf("%s/%d/%s.mp4", p.splitPrefix, slot, id)
+
+	err = p.uploadFile(processed, key)
+
+	if err != nil {
+		return err
+	}
+
+	err = p.addKeyToRedisSlot(key, slot)
+
+	if err != nil {
+		return err
+	}
+
+	log.Printf("Uploaded %s to s3://%s/%s", id, p.bucket, key)
+
+	return nil
+}
+
+// getSplitStart gets the start of
+func (p *Processor) getSplitStart(timecode timecode.Timecode, duration float64) (float64, error) {
+	// check that a video of duration can be split into a length specified by timecode
+	if timecode.Length > duration {
+		return -1, VideoTooShort
+	}
+
+	// Try to split starting at 40% through the video
+	if (duration*0.4)+timecode.Length <= duration {
+		return (duration * 0.4), nil
+	}
+
+	// If that's not possible, start at the beginning
+	return 0, nil
 }
 
 func (p *Processor) getDurationInSeconds(filename string) int {
@@ -189,6 +272,23 @@ func (p *Processor) getDurationInSeconds(filename string) int {
 	}
 
 	return int(f)
+}
+
+func (p *Processor) addKeyToRedisSlot(key string, slot int) error {
+	err := p.redis.SAdd(string(slot), key).Err()
+	return err
+}
+
+// uploadFile uploads a file to a key on S3
+func (p *Processor) uploadFile(r io.Reader, key string) error {
+	manager := s3manager.NewUploader(p.sess)
+	_, err := manager.Upload(&s3manager.UploadInput{
+		Key:    aws.String(key),
+		Bucket: aws.String(p.bucket),
+		Body:   r,
+	})
+
+	return err
 }
 
 // runCommand runs a cmd and gets the output (if any) and error (if any)
