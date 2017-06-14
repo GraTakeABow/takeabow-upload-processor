@@ -7,4 +7,5 @@ RUN apk add --update \
     && rm -rf /var/cache/apk/* > /dev/null
 ENV ZONEINFO /usr/share/zoneinfo/
 COPY takeabow-upload-processor /
+COPY timecodes.csv /
 ENTRYPOINT ["/takeabow-upload-processor"]
